@@ -182,28 +182,19 @@ module Win32
         end
       ensure
         # Stop the service.
-        SetTheServiceStatus.call(SERVICE_STOPPED, NO_ERROR, 0, 0)
+        # Report a non-zero win32 exit code so that if this thread is torn down
+        # abnormally (e.g. SCM start timeout), the SCM sees a failure and invokes
+        # the configured recovery/restart actions instead of treating it as a
+        # clean stop. (SureCritic fork: chef/win32-service#83)
+        SetTheServiceStatus.call(SERVICE_STOPPED, 1, 0, 0)
       end
     end
 
-    ThreadProc = FFI::Function.new(:ulong, [:pointer]) do |lpParameter|
-      ste = FFI::MemoryPointer.new(SERVICE_TABLE_ENTRY, 2)
-
-      s = SERVICE_TABLE_ENTRY.new(ste[0])
-      s[:lpServiceName] = FFI::MemoryPointer.from_string("")
-      s[:lpServiceProc] = lpParameter
-
-      s = SERVICE_TABLE_ENTRY.new(ste[1])
-      s[:lpServiceName] = nil
-      s[:lpServiceProc] = nil
-
-      # No service to step, no service handle, no ruby exceptions, just terminate the thread..
-      unless StartServiceCtrlDispatcher(ste)
-        return 1
-      end
-
-      return 0
-    end
+    # NOTE (SureCritic fork: chef/win32-service#85): the FFI ThreadProc that used
+    # to run StartServiceCtrlDispatcher via CreateThread has been removed. Under
+    # Ruby 3 that native-thread/Ruby-thread interleaving made StartServiceCtrlDispatcher
+    # take ~37s, blowing the SCM's 30s start timeout. The dispatcher now runs in a
+    # plain Ruby Thread created inside #mainloop instead.
 
     # This is a shortcut for Daemon.new + Daemon#mainloop.
     #
@@ -254,26 +245,34 @@ module Win32
         raise SystemCallError.new("CreateEvent", FFI.errno)
       end
 
-      hThread = CreateThread(nil, 0, ThreadProc, Service_Main, 0, nil)
+      # SureCritic fork (chef/win32-service#85): run the service-control dispatcher
+      # in a plain Ruby Thread instead of an FFI CreateThread. Under Ruby 3 the old
+      # native-thread approach made StartServiceCtrlDispatcher take ~37s, exceeding
+      # the SCM's 30s start timeout ("Service_Main thread exited abnormally").
+      hThread = Thread.new(Service_Main) do |lp_proc|
+        ste = FFI::MemoryPointer.new(SERVICE_TABLE_ENTRY, 2)
 
-      if hThread == 0
-        raise SystemCallError.new("CreateThread", FFI.errno)
+        s = SERVICE_TABLE_ENTRY.new(ste[0])
+        s[:lpServiceName] = FFI::MemoryPointer.from_string("")
+        s[:lpServiceProc] = lp_proc
+
+        s = SERVICE_TABLE_ENTRY.new(ste[1])
+        s[:lpServiceName] = nil
+        s[:lpServiceProc] = nil
+
+        StartServiceCtrlDispatcher(ste)
       end
 
-      events = FFI::MemoryPointer.new(:pointer, 2)
-      events.put_pointer(0, FFI::Pointer.new(hThread))
-      events.put_pointer(FFI::Pointer.size, FFI::Pointer.new(@@hStartEvent))
-
-      while (index = WaitForMultipleObjects(2, events, 0, 1000)) == WAIT_TIMEOUT
+      # Wait for the dispatcher to signal start. If the thread dies before signaling,
+      # the start failed. The sleep yields the GVL so the dispatcher thread can run
+      # (chef/win32-service#83) -- without it this loop can starve and deadlock on boot.
+      while (index = WaitForSingleObject(@@hStartEvent, 1000)) == WAIT_TIMEOUT
+        raise "Service_Main thread exited abnormally" unless hThread.alive?
+        sleep(0.1)
       end
 
       if index == WAIT_FAILED
-        raise SystemCallError.new("WaitForMultipleObjects", FFI.errno)
-      end
-
-      # The thread exited, so the show is off.
-      if index == WAIT_OBJECT_0
-        raise "Service_Main thread exited abnormally"
+        raise SystemCallError.new("WaitForSingleObject", FFI.errno)
       end
 
       thr = Thread.new do

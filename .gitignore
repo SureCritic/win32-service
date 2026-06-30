@@ -5,6 +5,10 @@ pkg
 */tags
 *~
 
+# Built gem artifact (reproducible from source via `gem build`; never commit it).
+# `gem build` from the repo root drops it here, outside the upstream-ignored pkg/ dir.
+*.gem
+
 # you should check in your Gemfile.lock in applications, and not in gems
 Gemfile.lock
 Gemfile.local

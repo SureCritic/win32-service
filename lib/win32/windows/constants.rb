@@ -139,5 +139,10 @@ module Windows
     ERROR_RESOURCE_TYPE_NOT_FOUND = 1813
     ERROR_RESOURCE_NAME_NOT_FOUND = 1814
     WAIT_FAILED = 0xFFFFFFFF
+
+    # Win32 exit code reported via SetServiceStatus when the service stops abnormally,
+    # so the SCM treats it as a failure and runs its recovery actions rather than seeing a clean (NO_ERROR) stop.
+    # Value is the generic ERROR_INVALID_FUNCTION (1); any non-zero code triggers recovery.
+    SERVICE_STOPPED_ABNORMALLY = 1
   end
 end

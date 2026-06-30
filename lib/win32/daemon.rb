@@ -181,29 +181,23 @@ module Win32
         while WaitForSingleObject(@@hStopCompletedEvent, 1000) != WAIT_OBJECT_0
         end
       ensure
-        # Stop the service.
-        SetTheServiceStatus.call(SERVICE_STOPPED, NO_ERROR, 0, 0)
+        # Stop the service. (SureCritic fork: chef/win32-service#83)
+        # Report a non-zero win32 exit code ONLY when the stop was NOT requested by the SCM
+        # -- i.e. the thread is unwinding for some other reason (an exception, or being torn down on the SCM start timeout).
+        # A non-zero code makes the SCM treat it as a failure and run the configured recovery/restart actions.
+        # On a real admin/shutdown-requested stop we report NO_ERROR so the SCM sees a clean stop and does NOT restart
+        # -- otherwise the service would relaunch itself on every intentional stop (maintenance, uninstall, our own restart/patch cycle).
+        graceful  = [SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN].include?(@@waiting_control_code)
+        exit_code = graceful ? NO_ERROR : SERVICE_STOPPED_ABNORMALLY
+        SetTheServiceStatus.call(SERVICE_STOPPED, exit_code, 0, 0)
       end
     end
 
-    ThreadProc = FFI::Function.new(:ulong, [:pointer]) do |lpParameter|
-      ste = FFI::MemoryPointer.new(SERVICE_TABLE_ENTRY, 2)
-
-      s = SERVICE_TABLE_ENTRY.new(ste[0])
-      s[:lpServiceName] = FFI::MemoryPointer.from_string("")
-      s[:lpServiceProc] = lpParameter
-
-      s = SERVICE_TABLE_ENTRY.new(ste[1])
-      s[:lpServiceName] = nil
-      s[:lpServiceProc] = nil
-
-      # No service to step, no service handle, no ruby exceptions, just terminate the thread..
-      unless StartServiceCtrlDispatcher(ste)
-        return 1
-      end
-
-      return 0
-    end
+    # NOTE (SureCritic fork: chef/win32-service#85):
+    # The FFI ThreadProc that used to run StartServiceCtrlDispatcher via CreateThread has been removed.
+    # Under Ruby 3 that native-thread/Ruby-thread interleaving made StartServiceCtrlDispatcher take ~37s,
+    # blowing the SCM's 30s start timeout.
+    # The dispatcher now runs in a plain Ruby Thread created inside #mainloop instead.
 
     # This is a shortcut for Daemon.new + Daemon#mainloop.
     #
@@ -254,26 +248,37 @@ module Win32
         raise SystemCallError.new("CreateEvent", FFI.errno)
       end
 
-      hThread = CreateThread(nil, 0, ThreadProc, Service_Main, 0, nil)
+      # SureCritic fork (chef/win32-service#85):
+      # run the service-control dispatcher in a plain Ruby Thread instead of an FFI CreateThread.
+      # Under Ruby 3 the old native-thread approach made StartServiceCtrlDispatcher take ~37s,
+      # exceeding the SCM's 30s start timeout ("Service_Main thread exited abnormally").
+      hThread = Thread.new(Service_Main) do |lp_proc|
+        ste = FFI::MemoryPointer.new(SERVICE_TABLE_ENTRY, 2)
 
-      if hThread == 0
-        raise SystemCallError.new("CreateThread", FFI.errno)
+        s = SERVICE_TABLE_ENTRY.new(ste[0])
+        s[:lpServiceName] = FFI::MemoryPointer.from_string("")
+        s[:lpServiceProc] = lp_proc
+
+        s = SERVICE_TABLE_ENTRY.new(ste[1])
+        s[:lpServiceName] = nil
+        s[:lpServiceProc] = nil
+
+        StartServiceCtrlDispatcher(ste)
       end
 
-      events = FFI::MemoryPointer.new(:pointer, 2)
-      events.put_pointer(0, FFI::Pointer.new(hThread))
-      events.put_pointer(FFI::Pointer.size, FFI::Pointer.new(@@hStartEvent))
-
-      while (index = WaitForMultipleObjects(2, events, 0, 1000)) == WAIT_TIMEOUT
+      # Wait for the dispatcher to signal start.
+      # If the thread dies before signaling, the start failed.
+      # The sleep yields the GVL so the dispatcher thread can run (chef/win32-service#83)
+      # -- without it this loop can starve and deadlock on boot.
+      while (index = WaitForSingleObject(@@hStartEvent, 1000)) == WAIT_TIMEOUT
+        raise "Service_Main thread exited abnormally" unless hThread.alive?
+        # applying some magic to delay things, as somehow this while loop can enter some kind of deadlock state without this,
+        # leading to our service not being able to boot.
+        sleep(0.1)
       end
 
       if index == WAIT_FAILED
-        raise SystemCallError.new("WaitForMultipleObjects", FFI.errno)
-      end
-
-      # The thread exited, so the show is off.
-      if index == WAIT_OBJECT_0
-        raise "Service_Main thread exited abnormally"
+        raise SystemCallError.new("WaitForSingleObject", FFI.errno)
       end
 
       thr = Thread.new do
